@@ -266,6 +266,95 @@ def _hnsw_payload_appears_sane(seg_dir: str) -> bool:
     return ratio is None or ratio <= _HNSW_LINK_TO_DATA_MAX_RATIO
 
 
+# chroma-hnswlib ``header.bin`` through ``M``: int version, size_t offsetLevel0, max_elements,
+# cur_element_count, size_data_per_element, label_offset, offsetData, int maxlevel, uint
+# enterpoint, size_t maxM, maxM0, M. Written field by field, so no padding.
+_HNSW_GRAPH_HEADER = struct.Struct("<i6QiI3Q")
+# A healthy ``link_lists.bin`` is a few MB even for hundreds of thousands of elements; refuse to
+# slurp a file far beyond that (bloated or sparse segments are the payload gates' business).
+_HNSW_GRAPH_MAX_LINK_BYTES = 256 * 1024 * 1024
+
+
+def hnsw_graph_findings(segment_dir: str) -> Optional[dict[str, int]]:
+    """Check a persisted HNSW graph's upper levels from its files alone.
+
+    ``repair-status`` compares counts, and ``_hnsw_payload_appears_sane`` compares file sizes;
+    neither looks at the graph. A graph can pass both and still make chromadb crash with an
+    access violation: an element on level >= 1 lists a neighbour that only exists on level 0, so
+    a level-1 search reaches a node that has no link list and dereferences ``nullptr``
+    (``getListCount`` in ``searchBaseLayer``). Every insert replayed from the WAL walks level 1
+    with probability 1/M, so the chance a replay of ``n`` inserts crashes is about
+    ``1 - (1 - 1/M)**n``: 6% for one insert with M=16, 64% for 16, near 100% for hundreds.
+
+    Walks ``link_lists.bin`` (one record per element: a ``uint32`` size followed by
+    ``size_links_per_element * level`` bytes) and counts upper-level links whose target is
+    out of range or has a lower level than the list it is in. Reads the files only; it never
+    opens a chromadb client, so it cannot be taken down by the corruption it looks for.
+
+    Returns ``{"elements", "upper_links", "dangling_links", "dangling_nodes"}``,
+    or ``None`` when the segment cannot be judged (no persisted index yet, an unknown header
+    version, files that do not match the header, any I/O error). Never raises.
+    """
+    if struct.calcsize("P") != 8:
+        return None
+    try:
+        with open(os.path.join(segment_dir, "header.bin"), "rb") as fh:
+            raw = fh.read(_HNSW_GRAPH_HEADER.size)
+        if len(raw) != _HNSW_GRAPH_HEADER.size:
+            return None
+        fields = _HNSW_GRAPH_HEADER.unpack(raw)
+        version, max_el, count, per, max_m = (fields[0], fields[2], fields[3], fields[4], fields[9])
+        if (
+            version != _HNSW_PERSISTENCE_VERSION
+            or count > max_el
+            or max_el > _HNSW_SANE_ELEMENT_CAP
+            or per == 0
+            or max_m == 0
+        ):
+            return None
+        link_path = os.path.join(segment_dir, "link_lists.bin")
+        if os.path.getsize(link_path) > _HNSW_GRAPH_MAX_LINK_BYTES:
+            return None
+        with open(link_path, "rb") as fh:
+            links = fh.read()
+        rec = max_m * 4 + 4  # size_links_per_element: uint32 count + max_m neighbour ids
+        levels = [0] * count
+        offsets = [0] * count
+        pos, end = 0, len(links)
+        for i in range(count):
+            if pos + 4 > end:
+                return None
+            (size,) = struct.unpack_from("<I", links, pos)
+            pos += 4
+            if size % rec or pos + size > end:
+                return None
+            levels[i], offsets[i] = size // rec, pos
+            pos += size
+        if pos != end:
+            return None
+        upper = dangling = 0
+        sources: set[int] = set()
+        for i in range(count):
+            for lvl in range(1, levels[i] + 1):
+                base = offsets[i] + (lvl - 1) * rec
+                (n,) = struct.unpack_from("<H", links, base)
+                if n > max_m:
+                    return None
+                for target in struct.unpack_from(f"<{n}I", links, base + 4):
+                    upper += 1
+                    if target >= count or levels[target] < lvl:
+                        dangling += 1
+                        sources.add(i)
+        return {
+            "elements": count,
+            "upper_links": upper,
+            "dangling_links": dangling,
+            "dangling_nodes": len(sources),
+        }
+    except (OSError, struct.error, MemoryError, ValueError):
+        return None
+
+
 # HNSW batch/sync thresholds applied at collection creation — chromadb's own
 # documented defaults (chromadb/api/configuration.py:263-273,
 # chromadb/api/collection_configuration.py:451-454,

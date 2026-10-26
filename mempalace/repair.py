@@ -50,7 +50,12 @@ from .backends._inproc_sqlite import (
     open_writer as open_palace_writer,
     release as release_palace_anchor,
 )
-from .backends.chroma import ChromaBackend, _clear_chroma_system_cache, hnsw_capacity_status
+from .backends.chroma import (
+    ChromaBackend,
+    _clear_chroma_system_cache,
+    hnsw_capacity_status,
+    hnsw_graph_findings,
+)
 
 # sqlite_read_uri stays in this module's namespace: callers and tests reach the
 # read-only URI through repair. Connections to chroma.sqlite3 go through
@@ -2837,6 +2842,30 @@ def status(palace_path=None, collection_name: Optional[str] = None) -> dict:
         print(f"    status:         {marker}")
         if info["message"]:
             print(f"    note:           {info['message']}")
+        # Counts and file sizes can both look healthy while the graph itself is torn; this reads
+        # link_lists.bin directly (no chromadb client) and is skipped when the segment can't be judged.
+        seg_id = info.get("segment_id")
+        graph = hnsw_graph_findings(os.path.join(palace_path, seg_id)) if seg_id else None
+        info["graph"] = graph
+        if graph is not None:
+            if graph["dangling_links"]:
+                print(
+                    f"    graph:          DANGLING ({graph['dangling_links']:,} upper-level links "
+                    f"from {graph['dangling_nodes']:,} nodes point to nodes that lack that level)"
+                )
+                print(
+                    "    note:           replaying the pending WAL onto this graph can crash chromadb "
+                    "with an access violation"
+                )
+            else:
+                print(f"    graph:          ok ({graph['upper_links']:,} upper-level links)")
+
+    if any((info.get("graph") or {}).get("dangling_links") for info in (drawers, closets)):
+        print(
+            "\n  The vector graph is internally inconsistent although the counts agree. The drawer rows\n"
+            "  are intact in SQLite; rebuild the index from them rather than re-mining:\n"
+            "\n      mempalace repair --mode from-sqlite --archive-existing"
+        )
 
     if drawers["diverged"] or closets["diverged"]:
         print(

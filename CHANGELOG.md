@@ -8,6 +8,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- `repair-status` now reads the HNSW graph itself, not just counts and file sizes. It reports
+  `graph: DANGLING (N upper-level links from M nodes point to nodes that lack that level)` when an
+  element on level 1 or above lists a neighbour that exists only on level 0. chromadb 1.5.x
+  dies with an access violation when a search or a WAL replay walks that link, while the counts
+  and file sizes still look healthy. The check reads `link_lists.bin` directly and never opens a
+  chromadb client. The existing `status:` verdict is unchanged; the new data is a `graph:` line and a
+  `graph` key in each collection's result. Also exposed as
+  `mempalace.backends.chroma.hnsw_graph_findings`.
+
 ---
 
 ## [3.12.0] — 2026-10-18
